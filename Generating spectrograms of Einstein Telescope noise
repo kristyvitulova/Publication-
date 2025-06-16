@@ -1,6 +1,6 @@
 """
 Einstein Telescope Noise Preparation Script
-Author: [Your Name]
+Author: Kristyna Vitulova
 Description:
     This script processes raw Einstein Telescope (ET) noise data in GWF format,
     extracts fixed-length segments, applies high-pass filtering and whitening,
