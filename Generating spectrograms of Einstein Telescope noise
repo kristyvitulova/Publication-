@@ -1,0 +1,130 @@
+"""
+Einstein Telescope Noise Preparation Script
+Author: [Your Name]
+Description:
+    This script processes raw Einstein Telescope (ET) noise data in GWF format,
+    extracts fixed-length segments, applies high-pass filtering and whitening,
+    and saves the resulting 1D time-domain waveforms as PyTorch tensors.
+    These waveforms are used as input to an autoencoder model for anomaly detection.
+
+Dependencies:
+    - numpy
+    - scipy
+    - torch
+    - gwpy
+    - os, pathlib
+
+Input:
+    Directory structure with .gwf files containing ET strain data (channel "E1:STRAIN").
+
+Output:
+    Batches of preprocessed waveform segments saved as .pt files in PyTorch format.
+
+Processing Steps:
+    1. High-pass filtering (to remove seismic noise below 20 Hz)
+    2. Whitening using Welch-estimated PSD
+    3. Batch-wise storage of 2-second waveform segments
+
+"""
+
+import os
+import numpy as np
+import torch
+from scipy.signal import butter, filtfilt, welch
+from gwpy.timeseries import TimeSeries
+
+# === Configuration ===
+base_data_dir = "/"# Insert the path to your directory containing .gwf files (noise-only strain data)
+channel = "E1:STRAIN"
+sample_rate = 8192  # Hz
+segment_duration = 2  # seconds
+segment_length = sample_rate * segment_duration
+batch_size = 1000
+output_folder = "/ET_segments_waveforms_final" # Replace with desired output path
+os.makedirs(output_folder, exist_ok=True)
+
+# === High-pass Filter ===
+def highpass_filter(data, cutoff=20, fs=sample_rate, order=6):
+    """
+    Removes low-frequency components below `cutoff` Hz.
+    Helps eliminate seismic and suspension noise in the detector.
+    """
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    b, a = butter(order, normal_cutoff, btype='high', analog=False)
+    return filtfilt(b, a, data)
+
+# === Whitening ===
+def whiten(data, f_psd, psd, fs):
+    """
+    Whitens the input time series using the estimated PSD.
+    This flattens the spectrum, making the data more Gaussian-like,
+    which is beneficial for many ML models.
+    """
+    psd = np.maximum(psd, 1e-20)  # Avoid division by zero
+    freqs = np.fft.fftfreq(len(data), d=1/fs)
+    psd_interp = np.interp(freqs, f_psd, psd)
+    white_fft = np.fft.fft(data) / np.sqrt(psd_interp)
+    return np.real(np.fft.ifft(white_fft))
+
+# === GWF File Discovery ===
+gwf_files = []
+for root, _, files in os.walk(base_data_dir):
+    for file in sorted(files):
+        if file.endswith(".gwf"):
+            gwf_files.append(os.path.join(root, file))
+
+print(f"Found {len(gwf_files)} .gwf files to process.")
+
+# === Main Processing Loop ===
+current_batch = []
+batch_counter = 0
+
+for idx, data_file in enumerate(gwf_files, 1):
+    print(f"[{idx}/{len(gwf_files)}] Processing file: {data_file}")
+
+    try:
+        # Load strain time series
+        strain = TimeSeries.read(data_file, channel=channel)
+        
+        # Estimate PSD using Welch method
+        f_psd, psd = welch(strain.value, fs=sample_rate, nperseg=4096)
+        
+        # Determine how many non-overlapping 2s segments fit in this file
+        num_segments = int((strain.times.value[-1] - strain.times.value[0]) // segment_duration)
+
+        for i in range(num_segments):
+            start = strain.times.value[0] + i * segment_duration
+            end = start + segment_duration
+            if end > strain.times.value[-1]:
+                break
+
+            # Crop, filter, and whiten segment
+            segment = strain.crop(start, end).value
+            segment = highpass_filter(segment)
+            segment = whiten(segment, f_psd, psd, sample_rate)
+
+            # Convert to tensor and add to batch
+            tensor = torch.tensor(segment, dtype=torch.float32).unsqueeze(0)  # Shape: [1, 8192]
+            current_batch.append(tensor)
+
+            # Save batch when full
+            if len(current_batch) >= batch_size:
+                batch_tensor = torch.cat(current_batch, dim=0)  # Shape: [batch_size, 8192]
+                save_path = os.path.join(output_folder, f"waveform_batch_{batch_counter:03d}.pt")
+                torch.save(batch_tensor, save_path)
+                print(f"Saved batch {batch_counter} with {len(current_batch)} waveform segments")
+                batch_counter += 1
+                current_batch = []
+
+    except Exception as e:
+        print(f"Error processing {data_file}: {e}")
+
+# === Save Final Batch ===
+if current_batch:
+    batch_tensor = torch.cat(current_batch, dim=0)
+    save_path = os.path.join(output_folder, f"waveform_batch_{batch_counter:03d}.pt")
+    torch.save(batch_tensor, save_path)
+    print(f"Saved final batch {batch_counter} with {len(current_batch)} waveform segments")
+
+print("All files processed. Waveform extraction complete.")
